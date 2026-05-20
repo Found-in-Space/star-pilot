@@ -41,7 +41,12 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: star-pilot/package-lock.json
+          cache-dependency-path: |
+            skykit/package-lock.json
+            star-pilot/package-lock.json
+
+      - run: npm ci
+        working-directory: skykit
 
       - run: npm ci
         working-directory: star-pilot
