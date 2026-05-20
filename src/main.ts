@@ -1,5 +1,5 @@
 import './style.css';
-import { Application, Graphics } from 'pixi.js';
+import { Application, Container, Graphics, Text } from 'pixi.js';
 import type { PlaneBasis, Vec2, Vec3 } from './math';
 import type { SliceStats, StarPoint } from './star-stream';
 import {
@@ -33,6 +33,18 @@ interface PointerState {
   y: number;
 }
 
+interface ScreenStar {
+  star: StarPoint;
+  x: number;
+  y: number;
+}
+
+interface AutoLabelState {
+  label: string | null;
+  pending: boolean;
+  text: Text | null;
+}
+
 const DEFAULT_CONFIG: GameConfig = {
   absoluteMagnitudeLimit: 12,
   normal: { x: 0, y: 0, z: 1 },
@@ -48,6 +60,13 @@ const ANGULAR_DAMPING = 0.18;
 const BRAKE_DAMPING = 0.03;
 const MAX_SPEED_PC = 58;
 const LOAD_OVERSCAN_MULTIPLIER = 2;
+const AUTO_LABEL_LIMIT = 10;
+const AUTO_LABEL_SCAN_LIMIT = 240;
+const LABEL_INTEREST_RADIUS_MULTIPLIER = 1.35;
+const LABEL_INTEREST_SCREEN_MARGIN_PX = 180;
+const LABEL_SCREEN_MARGIN_PX = 10;
+const LABEL_CHAR_WIDTH_PX = 6.6;
+const LABEL_OFFSET_Y_PX = 2;
 const QUERY_INTERVAL_MS = 300;
 
 const appRoot = document.querySelector<HTMLDivElement>('#app');
@@ -145,10 +164,12 @@ stageElement.prepend(pixi.canvas);
 
 const gridLayer = new Graphics();
 const starLayer = new Graphics();
+const labelLayer = new Container();
 const shipLayer = new Graphics();
-pixi.stage.addChild(gridLayer, starLayer, shipLayer);
+pixi.stage.addChild(gridLayer, starLayer, labelLayer, shipLayer);
 
 const keys = new Set<string>();
+const autoLabels = new Map<string, AutoLabelState>();
 const pointer: PointerState = { active: false, x: 0, y: 0 };
 const buttonControls = new Set<string>();
 const ship: ShipState = {
@@ -171,6 +192,8 @@ let latestStats: SliceStats = {
   status: 'idle',
 };
 let hoveredStarId = '';
+let autoLabelCandidateSignature = '';
+let autoLabelRequestSerial = 0;
 
 const starSource = createStarSliceSource((stats) => {
   latestStats = stats;
@@ -243,7 +266,7 @@ pixi.ticker.add((ticker) => {
     basis,
     center: shipWorld,
     thicknessPc: config.thicknessPc,
-    viewRadiusPc: config.viewRadiusPc,
+    viewRadiusPc: config.viewRadiusPc * LABEL_INTEREST_RADIUS_MULTIPLIER,
   });
   drawScene(stars);
   updateReadouts(stars);
@@ -259,6 +282,7 @@ function applyConfig(): void {
   shipWorld = planeToWorld(config.start, basis, ship.position);
   lastQueryCenter = null;
   nextQueryAt = 0;
+  clearAutoLabels();
   maybeLoadStars(true);
 }
 
@@ -297,19 +321,191 @@ function drawScene(stars: StarPoint[]): void {
     .lineTo(centerX, centerY + radiusPx)
     .stroke({ alpha: 0.12, color: 0xf5d36b, width: 1 });
 
+  const visibleStars: ScreenStar[] = [];
+  const labelInterestStars: ScreenStar[] = [];
   starLayer.clear();
   for (const star of stars) {
     const x = centerX + star.xPc * scale;
     const y = centerY - star.yPc * scale;
-    if (x < -8 || x > width + 8 || y < -8 || y > height + 8) {
+    if (isStarInLabelInterest(star, x, y, width, height)) {
+      labelInterestStars.push({ star, x, y });
+    }
+    if (!isStarInPlayView(star) || !isStarOnScreen(x, y, width, height)) {
       continue;
     }
+    visibleStars.push({ star, x, y });
     starLayer
       .circle(x, y, star.radiusPx)
       .fill({ alpha: star.screenAlpha, color: star.color });
   }
 
+  updateAutoLabels(visibleStars, labelInterestStars, width, height);
   drawShip(centerX, centerY);
+}
+
+function updateAutoLabels(
+  visibleStars: ScreenStar[],
+  labelInterestStars: ScreenStar[],
+  width: number,
+  height: number,
+): void {
+  const visibleById = new Map(visibleStars.map((entry) => [entry.star.id, entry]));
+  const interestIds = new Set(labelInterestStars.map((entry) => entry.star.id));
+  if (latestStats.status !== 'loading') {
+    for (const [starId, state] of autoLabels) {
+      if (interestIds.has(starId)) {
+        continue;
+      }
+      state.text?.destroy();
+      autoLabels.delete(starId);
+    }
+  }
+
+  const sortedCandidates = [...labelInterestStars]
+    .filter((entry) => entry.star.ref || entry.star.isSol)
+    .sort((left, right) => left.star.absoluteMagnitude - right.star.absoluteMagnitude);
+  const candidates = [
+    ...sortedCandidates.filter((entry) => entry.star.isSol),
+    ...sortedCandidates.filter((entry) => !entry.star.isSol),
+  ].slice(0, AUTO_LABEL_SCAN_LIMIT);
+  requestAutoLabels(candidates.map((entry) => entry.star));
+
+  for (const [starId, state] of autoLabels) {
+    const screenStar = visibleById.get(starId);
+    if (!screenStar || !state.label) {
+      if (state.text) {
+        state.text.visible = false;
+      }
+      continue;
+    }
+    const labelText = state.text ?? createAutoLabelText(state.label);
+    state.text = labelText;
+    if (!labelText.parent) {
+      labelLayer.addChild(labelText);
+    }
+    positionAutoLabel(labelText, screenStar, width, height);
+    labelText.visible = true;
+  }
+}
+
+function requestAutoLabels(stars: StarPoint[]): void {
+  const signature = stars.map((star) => star.id).join('|');
+  if (!signature || signature === autoLabelCandidateSignature) {
+    return;
+  }
+  autoLabelCandidateSignature = signature;
+  const requestSerial = ++autoLabelRequestSerial;
+
+  void starSource.resolveMapLabels(stars, AUTO_LABEL_LIMIT).then((labels) => {
+    if (requestSerial < autoLabelRequestSerial - 1) {
+      return;
+    }
+    for (const { label, starId } of labels) {
+      const state = autoLabels.get(starId) ?? {
+        label: null,
+        pending: false,
+        text: null,
+      };
+      if (state.label !== label) {
+        state.text?.destroy();
+        state.text = null;
+      }
+      state.label = label;
+      state.pending = false;
+      autoLabels.set(starId, state);
+    }
+  }).catch(() => {
+    if (requestSerial === autoLabelRequestSerial) {
+      autoLabelCandidateSignature = '';
+    }
+  });
+}
+
+function createAutoLabelText(label: string): Text {
+  const text = new Text({
+    text: label,
+    style: {
+      dropShadow: {
+        alpha: 0.6,
+        angle: Math.PI / 2,
+        blur: 3,
+        color: 0x02060a,
+        distance: 1,
+      },
+      fill: 0xeef8ff,
+      fontFamily: 'ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+      fontSize: 12,
+      fontWeight: '600',
+      letterSpacing: 0,
+      stroke: {
+        color: 0x071019,
+        width: 3,
+      },
+    },
+  });
+  text.eventMode = 'none';
+  text.roundPixels = true;
+  return text;
+}
+
+function positionAutoLabel(text: Text, screenStar: ScreenStar, width: number, height: number): void {
+  const estimatedWidth = text.text.length * LABEL_CHAR_WIDTH_PX;
+  text.anchor.set(0, 0);
+  text.alpha = clamp(screenStar.star.screenAlpha + 0.22, 0.62, 0.94);
+  text.position.set(
+    clamp(
+      screenStar.x - estimatedWidth / 2,
+      LABEL_SCREEN_MARGIN_PX,
+      Math.max(LABEL_SCREEN_MARGIN_PX, width - estimatedWidth - LABEL_SCREEN_MARGIN_PX),
+    ),
+    clamp(
+      screenStar.y + LABEL_OFFSET_Y_PX + screenStar.star.radiusPx,
+      LABEL_SCREEN_MARGIN_PX + 4,
+      height - LABEL_SCREEN_MARGIN_PX,
+    ),
+  );
+}
+
+function clearAutoLabels(): void {
+  for (const state of autoLabels.values()) {
+    state.text?.destroy();
+  }
+  autoLabels.clear();
+  labelLayer.removeChildren();
+  autoLabelCandidateSignature = '';
+  autoLabelRequestSerial += 1;
+}
+
+function isStarOnScreen(x: number, y: number, width: number, height: number): boolean {
+  return isStarWithinScreenMargin(x, y, width, height, LABEL_SCREEN_MARGIN_PX);
+}
+
+function isStarInLabelInterest(
+  star: StarPoint,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+): boolean {
+  return star.radialPc <= config.viewRadiusPc * LABEL_INTEREST_RADIUS_MULTIPLIER &&
+    isStarWithinScreenMargin(x, y, width, height, LABEL_INTEREST_SCREEN_MARGIN_PX);
+}
+
+function isStarInPlayView(star: StarPoint): boolean {
+  return star.radialPc <= config.viewRadiusPc;
+}
+
+function isStarWithinScreenMargin(
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  marginPx: number,
+): boolean {
+  return x >= -marginPx &&
+    x <= width + marginPx &&
+    y >= -marginPx &&
+    y <= height + marginPx;
 }
 
 function drawShip(centerX: number, centerY: number): void {
@@ -415,6 +611,7 @@ function maybeLoadStars(force: boolean): void {
     basis,
     center: shipWorld,
     loadRadiusPc: config.viewRadiusPc * LOAD_OVERSCAN_MULTIPLIER,
+    reset: force,
     thicknessPc: config.thicknessPc,
     viewRadiusPc: config.viewRadiusPc,
   });
@@ -521,6 +718,10 @@ function updateReadouts(stars: StarPoint[]): void {
   void starSource.resolveLabel(hovered).then((label) => {
     if (hovered.id === hoveredStarId) {
       hoverLabel.textContent = label;
+    }
+  }).catch((error: unknown) => {
+    if (hovered.id === hoveredStarId) {
+      hoverLabel.textContent = error instanceof Error ? error.message : 'label lookup failed';
     }
   });
 }

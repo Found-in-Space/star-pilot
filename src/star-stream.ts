@@ -2,7 +2,14 @@ import {
   OCTREE_DEFAULT,
   createStarOctreeProviderService,
 } from '@found-in-space/star-octree-provider';
-import { createMetaSidecarProviderService } from '@found-in-space/meta-sidecar-provider';
+import {
+  createMetaSidecarProviderService,
+  deriveMetaSidecarUrlFromRenderUrl,
+} from '@found-in-space/meta-sidecar-provider';
+import type {
+  MetaSidecarEntry,
+  MetaSidecarProviderService,
+} from '@found-in-space/meta-sidecar-provider';
 import { temperatureToRgb } from '@found-in-space/star-trees';
 import type {
   StarCellData,
@@ -14,8 +21,8 @@ import type { PlaneBasis, Vec3 } from './math';
 import { clamp, worldToPlaneOffset } from './math';
 import { createPizzaStrategy } from './pizza-strategy';
 
-const DATASET_ID = 'found-in-space-dataset';
 const MAX_DRAWN_STARS = 4500;
+const SOL_POSITION_EPSILON_PC = 1e-6;
 
 type StreamStatus = 'idle' | 'loading' | 'current' | 'error';
 
@@ -23,6 +30,7 @@ export interface SliceLoadOptions {
   basis: PlaneBasis;
   center: Vec3;
   loadRadiusPc: number;
+  reset?: boolean;
   thicknessPc: number;
   viewRadiusPc: number;
 }
@@ -37,16 +45,25 @@ export interface SliceStats {
 
 export interface StarPoint {
   absoluteMagnitude: number;
+  cellKey: string;
+  cellOrdinal: number;
   color: number;
   depthPc: number;
   id: string;
+  isSol: boolean;
   labelFallback: string;
   pickMeta: StarPickMeta | null;
+  radialPc: number;
   radiusPx: number;
   ref: StarObjectRef | null;
   screenAlpha: number;
   xPc: number;
   yPc: number;
+}
+
+export interface StarMapLabel {
+  label: string;
+  starId: string;
 }
 
 export interface StarSliceSource {
@@ -61,23 +78,43 @@ export interface StarSliceSource {
     viewRadiusPc: number;
   }): StarPoint[];
   resolveLabel(star: StarPoint): Promise<string>;
+  resolveMapLabels(stars: StarPoint[], limit: number): Promise<StarMapLabel[]>;
 }
 
 export function createStarSliceSource(onStats: (stats: SliceStats) => void): StarSliceSource {
   const starProvider = createStarOctreeProviderService({
-    datasetId: DATASET_ID,
     id: 'star-pilot-octree',
     persistentCache: 'on',
     url: OCTREE_DEFAULT,
   });
-  const metaProvider = createMetaSidecarProviderService({
-    entries: {},
-    id: 'star-pilot-meta',
-    parentDatasetId: DATASET_ID,
-  });
   const cells = new Map<string, StarCellData>();
   const labelCache = new Map<string, string>();
+  const mapLabelCache = new Map<string, string | null>();
+  const mapCellEntriesCache = new Map<string, Promise<MetaSidecarEntry[] | null>>();
   let abortController: AbortController | null = null;
+  let currentDatasetId: string | null = null;
+  let disposed = false;
+  let metaProvider: MetaSidecarProviderService | null = null;
+  let pendingLoadCellKeys: Set<string> | null = null;
+  const metaProviderPromise = starProvider.ensureBootstrap().then((bootstrap) => {
+    if (!bootstrap.datasetId) {
+      throw new Error('Star Pilot requires a render octree dataset id for meta sidecar lookup.');
+    }
+
+    currentDatasetId = bootstrap.datasetId;
+    const provider = createMetaSidecarProviderService({
+      id: 'star-pilot-meta',
+      parentDatasetId: bootstrap.datasetId,
+      persistentCache: 'on',
+      url: deriveMetaSidecarUrlFromRenderUrl(OCTREE_DEFAULT),
+    });
+    metaProvider = provider;
+    if (disposed) {
+      provider.dispose();
+    }
+    return provider;
+  });
+  void metaProviderPromise.catch(() => {});
   let streamId = 0;
   let stats: SliceStats = {
     cells: 0,
@@ -131,6 +168,7 @@ export function createStarSliceSource(onStats: (stats: SliceStats) => void): Sta
       if (id !== streamId || isAbortError(error)) {
         return;
       }
+      pendingLoadCellKeys = null;
       publish({
         message: error instanceof Error ? error.message : 'Star stream failed',
         status: 'error',
@@ -142,18 +180,29 @@ export function createStarSliceSource(onStats: (stats: SliceStats) => void): Sta
     if (delta.type === 'stars/cells-upsert') {
       for (const cell of delta.cells) {
         cells.set(cell.cellKey, cell);
+        pendingLoadCellKeys?.add(cell.cellKey);
       }
       updateCellStats('loading', 'streaming');
       return;
     }
     if (delta.type === 'stars/cells-remove') {
-      for (const cellKey of delta.cellKeys) {
-        cells.delete(cellKey);
+      if (!pendingLoadCellKeys) {
+        for (const cellKey of delta.cellKeys) {
+          cells.delete(cellKey);
+        }
       }
       updateCellStats('loading', 'refreshing');
       return;
     }
     if (delta.type === 'stars/current') {
+      if (pendingLoadCellKeys) {
+        for (const cellKey of cells.keys()) {
+          if (!pendingLoadCellKeys.has(cellKey)) {
+            cells.delete(cellKey);
+          }
+        }
+        pendingLoadCellKeys = null;
+      }
       updateCellStats('current', 'current');
       return;
     }
@@ -167,9 +216,12 @@ export function createStarSliceSource(onStats: (stats: SliceStats) => void): Sta
 
   return {
     dispose() {
+      disposed = true;
       abortController?.abort();
       cells.clear();
-      metaProvider.dispose();
+      pendingLoadCellKeys = null;
+      metaProvider?.dispose();
+      void metaProviderPromise.then((provider) => provider.dispose(), () => {});
       void starProvider.dispose();
     },
 
@@ -181,14 +233,19 @@ export function createStarSliceSource(onStats: (stats: SliceStats) => void): Sta
       abortController?.abort();
       abortController = new AbortController();
       streamId += 1;
-      cells.clear();
-      publish({
-        cells: 0,
-        drawnStars: 0,
-        message: 'loading',
-        rawStars: 0,
-        status: 'loading',
-      });
+      pendingLoadCellKeys = new Set();
+      if (options.reset) {
+        cells.clear();
+        publish({
+          cells: 0,
+          drawnStars: 0,
+          message: 'loading',
+          rawStars: 0,
+          status: 'loading',
+        });
+      } else {
+        updateCellStats('loading', 'loading');
+      }
       void runLoad(streamId, options, abortController.signal);
     },
 
@@ -205,6 +262,7 @@ export function createStarSliceSource(onStats: (stats: SliceStats) => void): Sta
             y: positions[offset + 1] ?? 0,
             z: positions[offset + 2] ?? 0,
           };
+          const isSol = isSolPosition(world);
           const plane = worldToPlaneOffset(options.center, options.basis, world);
           const radialPc = Math.hypot(plane.x, plane.y);
           if (Math.abs(plane.depth) > halfThickness || radialPc > options.viewRadiusPc) {
@@ -215,12 +273,12 @@ export function createStarSliceSource(onStats: (stats: SliceStats) => void): Sta
           const absoluteMagnitude = typeof magAbs === 'number' && Number.isFinite(magAbs)
             ? magAbs
             : options.absoluteMagnitudeLimit;
-          if (absoluteMagnitude > options.absoluteMagnitudeLimit) {
+          if (!isSol && absoluteMagnitude > options.absoluteMagnitudeLimit) {
             continue;
           }
 
           const color = colorForTemperature(cell.attributes.teffLog8?.[index]);
-          const ref = refForStar(cell, index);
+          const ref = refForStar(cell, index, currentDatasetId);
           const pickMeta = cell.pickMeta?.[index] ?? null;
           const id = ref
             ? `${ref.level}:${ref.mortonCode}:${ref.ordinal}`
@@ -230,11 +288,15 @@ export function createStarSliceSource(onStats: (stats: SliceStats) => void): Sta
 
           projected.push({
             absoluteMagnitude,
+            cellKey: cell.cellKey,
+            cellOrdinal: index,
             color,
             depthPc: plane.depth,
             id,
+            isSol,
             labelFallback: fallbackLabel(ref, cell.cellKey, index),
             pickMeta,
+            radialPc,
             radiusPx: clamp(0.55 + brightness * 3.1, 0.55, 3.65),
             ref,
             screenAlpha: clamp(0.13 + depthFade * 0.22 + brightness * 0.68, 0.11, 0.96),
@@ -245,13 +307,22 @@ export function createStarSliceSource(onStats: (stats: SliceStats) => void): Sta
       }
 
       projected.sort((a, b) => a.absoluteMagnitude - b.absoluteMagnitude);
-      const brightest = projected.slice(0, MAX_DRAWN_STARS);
+      const solStars = projected.filter((star) => star.isSol);
+      const brightest = [
+        ...projected
+          .filter((star) => !star.isSol)
+          .slice(0, Math.max(0, MAX_DRAWN_STARS - solStars.length)),
+        ...solStars,
+      ];
       brightest.sort((a, b) => b.absoluteMagnitude - a.absoluteMagnitude);
       publish({ drawnStars: brightest.length });
       return brightest;
     },
 
     async resolveLabel(star) {
+      if (star.isSol) {
+        return 'Sol';
+      }
       if (!star.ref) {
         return star.labelFallback;
       }
@@ -259,12 +330,111 @@ export function createStarSliceSource(onStats: (stats: SliceStats) => void): Sta
       if (cached) {
         return cached;
       }
-      const label = await metaProvider.resolvePrimaryLabel(star.ref);
+      const provider = await metaProviderPromise;
+      const entry = await provider.getMeta(star.ref);
+      const label = entry ? hoverLabelFromMeta(entry) : '';
       const resolved = label || star.labelFallback;
       labelCache.set(star.id, resolved);
       return resolved;
     },
+
+    async resolveMapLabels(stars, limit) {
+      if (limit <= 0) {
+        return [];
+      }
+
+      const candidates = stars
+        .filter((star) => star.ref || star.isSol)
+        .sort((left, right) => left.absoluteMagnitude - right.absoluteMagnitude);
+      const orderedCandidates = [
+        ...candidates.filter((star) => star.isSol),
+        ...candidates.filter((star) => !star.isSol),
+      ];
+      const byCell = new Map<string, StarPoint[]>();
+      for (const star of orderedCandidates) {
+        const cellStars = byCell.get(star.cellKey);
+        if (cellStars) {
+          cellStars.push(star);
+        } else {
+          byCell.set(star.cellKey, [star]);
+        }
+      }
+
+      const labels: StarMapLabel[] = [];
+      for (const star of orderedCandidates) {
+        if (labels.length >= limit) {
+          break;
+        }
+        if (star.isSol) {
+          mapLabelCache.set(star.id, 'Sol');
+          labels.push({ label: 'Sol', starId: star.id });
+          continue;
+        }
+        const cached = mapLabelCache.get(star.id);
+        if (cached !== undefined) {
+          if (cached) {
+            labels.push({ label: cached, starId: star.id });
+          }
+          continue;
+        }
+
+        try {
+          await hydrateMapLabelCell(star, byCell);
+        } catch {
+          mapLabelCache.set(star.id, null);
+          continue;
+        }
+        const label = mapLabelCache.get(star.id);
+        if (label) {
+          labels.push({ label, starId: star.id });
+        }
+      }
+
+      return labels;
+    },
   };
+
+  async function hydrateMapLabelCell(
+    star: StarPoint,
+    starsByCell: Map<string, StarPoint[]>,
+  ): Promise<void> {
+    let promise = mapCellEntriesCache.get(star.cellKey);
+    if (!promise) {
+      if (!star.ref) {
+        mapLabelCache.set(star.id, null);
+        return;
+      }
+
+      promise = (async () => {
+        const provider = await metaProviderPromise;
+        return provider.getMetaCell({
+          datasetId: star.ref?.datasetId,
+          level: star.ref?.level ?? 0,
+          mortonCode: star.ref?.mortonCode ?? '0',
+        });
+      })();
+      promise.catch(() => {
+        mapCellEntriesCache.delete(star.cellKey);
+      });
+      mapCellEntriesCache.set(star.cellKey, promise);
+    }
+
+    const entries = await promise;
+    const cellStars = starsByCell.get(star.cellKey) ?? [star];
+
+    for (const cellStar of cellStars) {
+      if (cellStar.isSol) {
+        mapLabelCache.set(cellStar.id, 'Sol');
+        continue;
+      }
+      if (!cellStar.ref) {
+        mapLabelCache.set(cellStar.id, null);
+        continue;
+      }
+      const entry = entries?.[cellStar.ref.ordinal] ?? null;
+      mapLabelCache.set(cellStar.id, entry ? automaticMapLabelFromMeta(entry) : null);
+    }
+  }
 }
 
 function colorForTemperature(teffLog8: number | undefined): number {
@@ -288,23 +458,113 @@ function fallbackLabel(ref: StarObjectRef | null, cellKey: string, ordinal: numb
   return `cell ${ref.level}:${ref.mortonCode} / ${ref.ordinal}`;
 }
 
+function isSolPosition(worldPc: Vec3): boolean {
+  return Math.hypot(worldPc.x, worldPc.y, worldPc.z) <= SOL_POSITION_EPSILON_PC;
+}
+
+function automaticMapLabelFromMeta(entry: MetaSidecarEntry): string | null {
+  const properName = metaString(entry.proper_name);
+  if (properName) {
+    return properName;
+  }
+
+  const flamsteed = metaString(entry.flamsteed);
+  if (!flamsteed) {
+    return null;
+  }
+  const constellation = metaString(entry.constellation);
+  return constellation ? `${flamsteed} ${constellation}` : flamsteed;
+}
+
+function hoverLabelFromMeta(entry: MetaSidecarEntry): string | null {
+  const properName = metaString(entry.proper_name);
+  if (properName) return properName;
+
+  const bayer = formatBayerDesignation(entry);
+  if (bayer) return bayer;
+
+  const flamsteed = automaticMapLabelFromMeta(entry);
+  if (flamsteed) return flamsteed;
+
+  const hd = metaString(entry.hd);
+  if (hd) return `HD ${hd}`;
+
+  const hip = metaString(entry.hip_id);
+  if (hip) return `HIP ${hip}`;
+
+  const gaia = metaString(entry.gaia_source_id);
+  if (gaia) return `Gaia ${gaia}`;
+
+  const source = metaString(entry.source);
+  const sourceId = metaString(entry.source_id);
+  return source && sourceId ? `${source} ${sourceId}` : null;
+}
+
+function formatBayerDesignation(entry: MetaSidecarEntry): string | null {
+  const bayer = metaString(entry.bayer);
+  if (!bayer) {
+    return null;
+  }
+  const constellation = metaString(entry.constellation);
+  if (!constellation || designationEndsWithConstellation(bayer, constellation)) {
+    return bayer;
+  }
+  return `${bayer} ${constellation}`;
+}
+
+function designationEndsWithConstellation(value: string, constellation: string): boolean {
+  const lowerValue = value.toLowerCase();
+  const lowerConstellation = constellation.toLowerCase();
+  if (!lowerValue.endsWith(lowerConstellation)) {
+    return false;
+  }
+  if (lowerValue.length === lowerConstellation.length) {
+    return true;
+  }
+  const separator = value[value.length - constellation.length - 1];
+  return separator === ' ' || separator === '-';
+}
+
+function metaString(value: unknown): string {
+  if (value == null) {
+    return '';
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
+  if (typeof value !== 'string') {
+    return '';
+  }
+  return value.trim();
+}
+
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError'
     || error instanceof Error && error.name === 'AbortError';
 }
 
-function refForStar(cell: StarCellData, ordinal: number): StarObjectRef | null {
+function refForStar(
+  cell: StarCellData,
+  ordinal: number,
+  datasetId: string | null,
+): StarObjectRef | null {
   const ref = cell.refs?.[ordinal];
   if (ref) {
     return {
-      datasetId: ref.datasetId ?? DATASET_ID,
+      datasetId: ref.datasetId ?? datasetId,
       level: ref.level,
       mortonCode: ref.mortonCode,
       ordinal: ref.ordinal,
     };
   }
+  if (!datasetId) {
+    return null;
+  }
   return {
-    datasetId: DATASET_ID,
+    datasetId,
     level: cell.cell.level,
     mortonCode: cell.cell.mortonCode,
     ordinal,

@@ -20,10 +20,14 @@ triangle ship with PixiJS.
 This is intentionally game-like rather than physically photometric: stars inside
 the slice are visible, and draw size/brightness comes from absolute magnitude
 only rather than distance-based apparent magnitude.
-The sidecar label resolver is already wired through
-`@found-in-space/meta-sidecar-provider`; it currently uses an empty in-memory
-entry set until generated meta sidecar cells are exposed through the alpha
-package boundary.
+The sidecar label resolver is wired through
+`@found-in-space/meta-sidecar-provider`. Star Pilot derives the render dataset id
+from the star octree descriptor, opens the matching generated `meta` sidecar, and
+uses public `StarObjectRef` values for raw metadata lookups. Hover labels use an
+app-local metadata formatter; automatic map labels are limited to stars with a
+proper name or Flamsteed designation and are chosen by walking the brightest
+loaded stars, fetching each needed sidecar cell once.
+For the demo, Star Pilot also labels the origin star `(0, 0, 0)` as Sol.
 
 ## Development
 
