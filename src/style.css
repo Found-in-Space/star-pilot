@@ -40,10 +40,7 @@ button {
   display: grid;
   grid-template-columns: minmax(290px, 340px) minmax(0, 1fr);
   min-height: 100svh;
-  background:
-    radial-gradient(circle at 72% 28%, rgba(28, 230, 184, 0.12), transparent 28rem),
-    radial-gradient(circle at 92% 72%, rgba(255, 138, 61, 0.1), transparent 24rem),
-    #050604;
+  background: #050604;
 }
 
 .control-panel {
@@ -195,6 +192,7 @@ dd {
   min-width: 0;
   min-height: 100svh;
   overflow: hidden;
+  background: #000;
 }
 
 .stage-canvas {

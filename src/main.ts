@@ -84,7 +84,7 @@ const DEFAULT_CONFIG: GameConfig = {
   normal: { x: 0, y: 0, z: 1 },
   start: { x: 0, y: 0, z: 0 },
   thicknessPc: 20,
-  viewRadiusPc: 18,
+  viewRadiusPc: 10,
 };
 
 const SHIP_ACCELERATION_PC = 20;
@@ -117,7 +117,6 @@ const PARTICLE_DRAG = 0.82;
 const LOAD_OVERSCAN_MULTIPLIER = 2;
 const AUTO_LABEL_LIMIT = 10;
 const AUTO_LABEL_SCAN_LIMIT = 240;
-const LABEL_INTEREST_RADIUS_MULTIPLIER = 1.35;
 const LABEL_INTEREST_SCREEN_MARGIN_PX = 180;
 const LABEL_SCREEN_MARGIN_PX = 10;
 const LABEL_CHAR_WIDTH_PX = 6.6;
@@ -220,12 +219,11 @@ await pixi.init({
 pixi.canvas.className = 'stage-canvas';
 stageElement.prepend(pixi.canvas);
 
-const gridLayer = new Graphics();
 const starLayer = new Graphics();
 const effectsLayer = new Graphics();
 const labelLayer = new Container();
 const shipLayer = new Graphics();
-pixi.stage.addChild(gridLayer, starLayer, effectsLayer, labelLayer, shipLayer);
+pixi.stage.addChild(starLayer, effectsLayer, labelLayer, shipLayer);
 
 const keys = new Set<string>();
 const projectiles: Projectile[] = [];
@@ -368,7 +366,7 @@ pixi.ticker.add((ticker) => {
     basis,
     center: shipWorld,
     thicknessPc: config.thicknessPc,
-    viewRadiusPc: config.viewRadiusPc * LABEL_INTEREST_RADIUS_MULTIPLIER,
+    viewRadiusPc: projectedViewportRadiusPc(),
   });
   drawScene(stars);
   updateReadouts(stars);
@@ -409,18 +407,6 @@ function drawScene(stars: StarPoint[]): void {
   const centerY = height / 2;
   const scale = pixelsPerParsec();
 
-  gridLayer.clear();
-  const radiusPx = config.viewRadiusPc * scale;
-  gridLayer
-    .circle(centerX, centerY, radiusPx)
-    .stroke({ alpha: 0.2, color: 0x83d6ff, width: 1 });
-  gridLayer
-    .moveTo(centerX - radiusPx, centerY)
-    .lineTo(centerX + radiusPx, centerY)
-    .moveTo(centerX, centerY - radiusPx)
-    .lineTo(centerX, centerY + radiusPx)
-    .stroke({ alpha: 0.12, color: 0xf5d36b, width: 1 });
-
   const visibleStars: ScreenStar[] = [];
   const labelInterestStars: ScreenStar[] = [];
   starLayer.clear();
@@ -430,7 +416,7 @@ function drawScene(stars: StarPoint[]): void {
     if (isStarInLabelInterest(star, x, y, width, height)) {
       labelInterestStars.push({ star, x, y });
     }
-    if (!isStarInPlayView(star) || !isStarOnScreen(x, y, width, height)) {
+    if (!isStarOnScreen(x, y, width, height)) {
       continue;
     }
     visibleStars.push({ star, x, y });
@@ -582,18 +568,13 @@ function isStarOnScreen(x: number, y: number, width: number, height: number): bo
 }
 
 function isStarInLabelInterest(
-  star: StarPoint,
+  _star: StarPoint,
   x: number,
   y: number,
   width: number,
   height: number,
 ): boolean {
-  return star.radialPc <= config.viewRadiusPc * LABEL_INTEREST_RADIUS_MULTIPLIER &&
-    isStarWithinScreenMargin(x, y, width, height, LABEL_INTEREST_SCREEN_MARGIN_PX);
-}
-
-function isStarInPlayView(star: StarPoint): boolean {
-  return star.radialPc <= config.viewRadiusPc;
+  return isStarWithinScreenMargin(x, y, width, height, LABEL_INTEREST_SCREEN_MARGIN_PX);
 }
 
 function isStarWithinScreenMargin(
@@ -742,16 +723,28 @@ function maybeLoadStars(force: boolean): void {
   starSource.load({
     basis,
     center: shipWorld,
-    loadRadiusPc: config.viewRadiusPc * LOAD_OVERSCAN_MULTIPLIER,
+    loadRadiusPc: loadViewportRadiusPc(),
     reset: force,
     thicknessPc: config.thicknessPc,
-    viewRadiusPc: config.viewRadiusPc,
+    viewRadiusPc: projectedViewportRadiusPc(),
   });
 }
 
 function pixelsPerParsec(): number {
   const shortestSide = Math.max(320, Math.min(pixi.screen.width, pixi.screen.height));
   return shortestSide / (config.viewRadiusPc * 2.25);
+}
+
+function viewportHalfDiagonalPc(): number {
+  return Math.hypot(pixi.screen.width, pixi.screen.height) / (2 * pixelsPerParsec());
+}
+
+function projectedViewportRadiusPc(): number {
+  return viewportHalfDiagonalPc() + LABEL_INTEREST_SCREEN_MARGIN_PX / pixelsPerParsec();
+}
+
+function loadViewportRadiusPc(): number {
+  return Math.max(config.viewRadiusPc, viewportHalfDiagonalPc()) * LOAD_OVERSCAN_MULTIPLIER;
 }
 
 function readConfigFromForm(): GameConfig {
