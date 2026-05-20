@@ -49,16 +49,17 @@ const DEFAULT_CONFIG: GameConfig = {
   absoluteMagnitudeLimit: 12,
   normal: { x: 0, y: 0, z: 1 },
   start: { x: 0, y: 0, z: 0 },
-  thicknessPc: 4,
+  thicknessPc: 20,
   viewRadiusPc: 18,
 };
 
 const SHIP_ACCELERATION_PC = 20;
-const REVERSE_ACCELERATION_PC = 8;
 const TURN_ACCELERATION = 7.5;
 const ANGULAR_DAMPING = 0.18;
-const BRAKE_DAMPING = 0.03;
 const MAX_SPEED_PC = 58;
+const STOP_AUTOPILOT_ALIGNMENT_RADIANS = 0.12;
+const STOP_AUTOPILOT_STOP_SPEED_PC = 0.08;
+const STOP_AUTOPILOT_TURN_GAIN = 3.2;
 const LOAD_OVERSCAN_MULTIPLIER = 2;
 const AUTO_LABEL_LIMIT = 10;
 const AUTO_LABEL_SCAN_LIMIT = 240;
@@ -78,8 +79,11 @@ appRoot.innerHTML = `
   <main class="pilot-shell">
     <aside class="control-panel">
       <header class="panel-header">
-        <p class="eyebrow">SkyKit alpha</p>
-        <h1>Star Pilot</h1>
+        <img class="brand-mark" src="./robbie.svg" alt="" aria-hidden="true">
+        <div class="brand-copy">
+          <p class="eyebrow">Found in Space - SkyKit</p>
+          <h1>Star Pilot</h1>
+        </div>
       </header>
 
       <form id="config-form" class="config-form">
@@ -136,7 +140,6 @@ appRoot.innerHTML = `
         <button type="button" data-control="left" aria-label="Rotate left">&#9664;</button>
         <button type="button" data-control="thrust" aria-label="Thrust">&#9650;</button>
         <button type="button" data-control="right" aria-label="Rotate right">&#9654;</button>
-        <button type="button" data-control="brake" aria-label="Brake">&#9670;</button>
       </div>
     </section>
   </main>
@@ -194,6 +197,8 @@ let latestStats: SliceStats = {
 let hoveredStarId = '';
 let autoLabelCandidateSignature = '';
 let autoLabelRequestSerial = 0;
+let stopAutopilotActive = false;
+let stopAutopilotThrusting = false;
 
 const starSource = createStarSliceSource((stats) => {
   latestStats = stats;
@@ -205,7 +210,18 @@ form.addEventListener('submit', (event) => {
 });
 
 window.addEventListener('keydown', (event) => {
-  if (!isFlightKey(event.code) || isEditingInput(event.target)) {
+  if (isEditingInput(event.target)) {
+    return;
+  }
+  if (event.code === 'KeyH') {
+    event.preventDefault();
+    engageStopAutopilot();
+    return;
+  }
+  if (stopAutopilotActive) {
+    cancelStopAutopilot();
+  }
+  if (!isManualFlightKey(event.code)) {
     return;
   }
   event.preventDefault();
@@ -223,6 +239,7 @@ for (const button of document.querySelectorAll<HTMLButtonElement>('[data-control
   }
   button.addEventListener('pointerdown', (event) => {
     event.preventDefault();
+    cancelStopAutopilot();
     button.setPointerCapture(event.pointerId);
     buttonControls.add(control);
   });
@@ -279,6 +296,7 @@ function applyConfig(): void {
   ship.velocity = { x: 0, y: 0 };
   ship.angularVelocity = 0;
   ship.heading = Math.PI / 2;
+  cancelStopAutopilot();
   shipWorld = planeToWorld(config.start, basis, ship.position);
   lastQueryCenter = null;
   nextQueryAt = 0;
@@ -286,7 +304,7 @@ function applyConfig(): void {
   maybeLoadStars(true);
 }
 
-function controlActive(control: 'brake' | 'left' | 'reverse' | 'right' | 'thrust'): boolean {
+function controlActive(control: 'left' | 'right' | 'thrust'): boolean {
   if (control === 'left') {
     return keys.has('ArrowLeft') || keys.has('KeyA') || buttonControls.has('left');
   }
@@ -296,10 +314,7 @@ function controlActive(control: 'brake' | 'left' | 'reverse' | 'right' | 'thrust
   if (control === 'thrust') {
     return keys.has('ArrowUp') || keys.has('KeyW') || buttonControls.has('thrust');
   }
-  if (control === 'reverse') {
-    return keys.has('ArrowDown') || keys.has('KeyS');
-  }
-  return keys.has('Space') || buttonControls.has('brake');
+  return false;
 }
 
 function drawScene(stars: StarPoint[]): void {
@@ -533,7 +548,7 @@ function drawShip(centerX: number, centerY: number): void {
     .fill({ alpha: 0.86, color: 0xfff7d1 })
     .stroke({ alpha: 0.95, color: 0x1ce6b8, width: 2 });
 
-  if (controlActive('thrust')) {
+  if ((!stopAutopilotActive && controlActive('thrust')) || stopAutopilotThrusting) {
     const flame = {
       x: direction.x * -26,
       y: direction.y * -26,
@@ -583,17 +598,14 @@ function isEditingInput(target: EventTarget | null): boolean {
     || target instanceof HTMLSelectElement;
 }
 
-function isFlightKey(code: string): boolean {
+function isManualFlightKey(code: string): boolean {
   return [
-    'ArrowDown',
     'ArrowLeft',
     'ArrowRight',
     'ArrowUp',
     'KeyA',
     'KeyD',
-    'KeyS',
     'KeyW',
-    'Space',
   ].includes(code);
 }
 
@@ -664,23 +676,18 @@ function requireElement<T extends Element>(selector: string): T {
 }
 
 function stepShip(dt: number): void {
-  const turn = Number(controlActive('left')) - Number(controlActive('right'));
-  ship.angularVelocity += turn * TURN_ACCELERATION * dt;
-  ship.angularVelocity *= Math.pow(ANGULAR_DAMPING, dt);
-  ship.heading += ship.angularVelocity * dt;
+  stopAutopilotThrusting = false;
+  const thrust = stopAutopilotActive
+    ? updateStopAutopilot(dt)
+    : updateManualFlight(dt);
 
   const direction = {
     x: Math.cos(ship.heading),
     y: Math.sin(ship.heading),
   };
-  const thrust = Number(controlActive('thrust')) - Number(controlActive('reverse')) * 0.55;
-  const acceleration = thrust >= 0 ? SHIP_ACCELERATION_PC : REVERSE_ACCELERATION_PC;
-  ship.velocity.x += direction.x * thrust * acceleration * dt;
-  ship.velocity.y += direction.y * thrust * acceleration * dt;
-
-  if (controlActive('brake')) {
-    ship.velocity.x *= Math.pow(BRAKE_DAMPING, dt);
-    ship.velocity.y *= Math.pow(BRAKE_DAMPING, dt);
+  if (thrust > 0) {
+    ship.velocity.x += direction.x * thrust * SHIP_ACCELERATION_PC * dt;
+    ship.velocity.y += direction.y * thrust * SHIP_ACCELERATION_PC * dt;
   }
 
   const limitedVelocity = limit2(ship.velocity, MAX_SPEED_PC);
@@ -688,6 +695,82 @@ function stepShip(dt: number): void {
   ship.velocity.y = limitedVelocity.y;
   ship.position.x += ship.velocity.x * dt;
   ship.position.y += ship.velocity.y * dt;
+}
+
+function updateManualFlight(dt: number): number {
+  const turn = Number(controlActive('left')) - Number(controlActive('right'));
+  ship.angularVelocity += turn * TURN_ACCELERATION * dt;
+  ship.angularVelocity *= Math.pow(ANGULAR_DAMPING, dt);
+  ship.heading += ship.angularVelocity * dt;
+  return Number(controlActive('thrust'));
+}
+
+function updateStopAutopilot(dt: number): number {
+  const speed = length2(ship.velocity);
+  if (speed <= STOP_AUTOPILOT_STOP_SPEED_PC) {
+    finishStopAutopilot();
+    return 0;
+  }
+
+  const desiredHeading = Math.atan2(-ship.velocity.y, -ship.velocity.x);
+  const headingError = signedAngleDelta(ship.heading, desiredHeading);
+  const turn = clamp(
+    headingError * STOP_AUTOPILOT_TURN_GAIN,
+    -1,
+    1,
+  );
+  ship.angularVelocity += turn * TURN_ACCELERATION * dt;
+  ship.angularVelocity *= Math.pow(ANGULAR_DAMPING, dt);
+  ship.heading += ship.angularVelocity * dt;
+
+  const alignedError = Math.abs(signedAngleDelta(ship.heading, desiredHeading));
+  if (alignedError > STOP_AUTOPILOT_ALIGNMENT_RADIANS) {
+    return 0;
+  }
+
+  if (speed <= SHIP_ACCELERATION_PC * dt + STOP_AUTOPILOT_STOP_SPEED_PC) {
+    finishStopAutopilot();
+    return 0;
+  }
+
+  stopAutopilotThrusting = true;
+  return 1;
+}
+
+function engageStopAutopilot(): void {
+  clearManualFlightInputs();
+  if (length2(ship.velocity) <= STOP_AUTOPILOT_STOP_SPEED_PC) {
+    finishStopAutopilot();
+    return;
+  }
+  stopAutopilotActive = true;
+  stopAutopilotThrusting = false;
+  ship.angularVelocity = 0;
+}
+
+function cancelStopAutopilot(): void {
+  stopAutopilotActive = false;
+  stopAutopilotThrusting = false;
+}
+
+function finishStopAutopilot(): void {
+  ship.velocity.x = 0;
+  ship.velocity.y = 0;
+  ship.angularVelocity = 0;
+  cancelStopAutopilot();
+}
+
+function clearManualFlightInputs(): void {
+  for (const key of [...keys]) {
+    if (isManualFlightKey(key)) {
+      keys.delete(key);
+    }
+  }
+  buttonControls.clear();
+}
+
+function signedAngleDelta(from: number, to: number): number {
+  return Math.atan2(Math.sin(to - from), Math.cos(to - from));
 }
 
 function updateReadouts(stars: StarPoint[]): void {
