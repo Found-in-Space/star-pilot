@@ -45,6 +45,40 @@ interface AutoLabelState {
   text: Text | null;
 }
 
+interface Projectile {
+  age: number;
+  life: number;
+  ownerFuse: number;
+  position: Vec2;
+  velocity: Vec2;
+}
+
+interface Particle {
+  age: number;
+  color: number;
+  kind: 'debris' | 'spark';
+  life: number;
+  position: Vec2;
+  sizePx: number;
+  velocity: Vec2;
+}
+
+interface Shard {
+  age: number;
+  angle: number;
+  angularVelocity: number;
+  color: number;
+  lengthPx: number;
+  life: number;
+  position: Vec2;
+  velocity: Vec2;
+}
+
+interface ExplosionState {
+  respawnInSeconds: number;
+  shipAlive: boolean;
+}
+
 const DEFAULT_CONFIG: GameConfig = {
   absoluteMagnitudeLimit: 12,
   normal: { x: 0, y: 0, z: 1 },
@@ -57,9 +91,29 @@ const SHIP_ACCELERATION_PC = 20;
 const TURN_ACCELERATION = 7.5;
 const ANGULAR_DAMPING = 0.18;
 const MAX_SPEED_PC = 58;
+const SHIP_COLLISION_RADIUS_PX = 15;
+const SHIP_ENGINE_POINT_PX: Vec2 = { x: -10, y: 0 };
+const SHIP_GUN_POINT_PX: Vec2 = { x: 16, y: 0 };
+const SHIP_POINTS_PX: Vec2[] = [
+  { x: 16, y: 0 },
+  { x: -10, y: 9 },
+  { x: -10, y: -9 },
+];
 const STOP_AUTOPILOT_ALIGNMENT_RADIANS = 0.12;
 const STOP_AUTOPILOT_STOP_SPEED_PC = 0.08;
 const STOP_AUTOPILOT_TURN_GAIN = 3.2;
+const FIRE_COOLDOWN_SECONDS = 0.14;
+const PROJECTILE_LIFE_SECONDS = 4;
+const PROJECTILE_OWNER_FUSE_SECONDS = 0.25;
+const PROJECTILE_SIZE_PX = 3;
+const PROJECTILE_SPEED_PC = 18;
+const SPARKS_PER_SECOND = 110;
+const SPARK_SIZE_PX = 2;
+const SPARK_SPREAD_RADIANS = Math.PI * 0.4;
+const SPARK_COLORS = [0xfff2bd, 0xffbb43, 0xff6330, 0xe93826];
+const DEBRIS_COLORS = [0xffffff, 0xffe58f, 0xff813a, 0xff3a27];
+const EXPLOSION_RESPAWN_SECONDS = 1.2;
+const PARTICLE_DRAG = 0.82;
 const LOAD_OVERSCAN_MULTIPLIER = 2;
 const AUTO_LABEL_LIMIT = 10;
 const AUTO_LABEL_SCAN_LIMIT = 240;
@@ -140,6 +194,7 @@ appRoot.innerHTML = `
         <button type="button" data-control="left" aria-label="Rotate left">&#9664;</button>
         <button type="button" data-control="thrust" aria-label="Thrust">&#9650;</button>
         <button type="button" data-control="right" aria-label="Rotate right">&#9654;</button>
+        <button type="button" data-control="fire" aria-label="Fire">&#9679;</button>
       </div>
     </section>
   </main>
@@ -167,11 +222,15 @@ stageElement.prepend(pixi.canvas);
 
 const gridLayer = new Graphics();
 const starLayer = new Graphics();
+const effectsLayer = new Graphics();
 const labelLayer = new Container();
 const shipLayer = new Graphics();
-pixi.stage.addChild(gridLayer, starLayer, labelLayer, shipLayer);
+pixi.stage.addChild(gridLayer, starLayer, effectsLayer, labelLayer, shipLayer);
 
 const keys = new Set<string>();
+const projectiles: Projectile[] = [];
+const particles: Particle[] = [];
+const shards: Shard[] = [];
 const autoLabels = new Map<string, AutoLabelState>();
 const pointer: PointerState = { active: false, x: 0, y: 0 };
 const buttonControls = new Set<string>();
@@ -181,6 +240,7 @@ const ship: ShipState = {
   position: { x: 0, y: 0 },
   velocity: { x: 0, y: 0 },
 };
+let previousShipPosition: Vec2 = { ...ship.position };
 
 let config = readConfigFromForm();
 let basis: PlaneBasis = planeBasisFromNormal(config.normal);
@@ -198,7 +258,12 @@ let hoveredStarId = '';
 let autoLabelCandidateSignature = '';
 let autoLabelRequestSerial = 0;
 let stopAutopilotActive = false;
-let stopAutopilotThrusting = false;
+let shotCooldown = 0;
+let sparkAccumulator = 0;
+const explosion: ExplosionState = {
+  respawnInSeconds: 0,
+  shipAlive: true,
+};
 
 const starSource = createStarSliceSource((stats) => {
   latestStats = stats;
@@ -218,11 +283,20 @@ window.addEventListener('keydown', (event) => {
     engageStopAutopilot();
     return;
   }
-  if (stopAutopilotActive) {
+  if (isFireKey(event.code)) {
+    event.preventDefault();
     cancelStopAutopilot();
+    if (!keys.has(event.code)) {
+      requestFire();
+    }
+    keys.add(event.code);
+    return;
   }
   if (!isManualFlightKey(event.code)) {
     return;
+  }
+  if (stopAutopilotActive) {
+    cancelStopAutopilot();
   }
   event.preventDefault();
   keys.add(event.code);
@@ -242,6 +316,9 @@ for (const button of document.querySelectorAll<HTMLButtonElement>('[data-control
     cancelStopAutopilot();
     button.setPointerCapture(event.pointerId);
     buttonControls.add(control);
+    if (control === 'fire') {
+      requestFire();
+    }
   });
   button.addEventListener('pointerup', () => {
     buttonControls.delete(control);
@@ -275,7 +352,15 @@ applyConfig();
 
 pixi.ticker.add((ticker) => {
   const dt = Math.min(0.05, ticker.deltaMS / 1000);
-  stepShip(dt);
+  if (explosion.shipAlive) {
+    previousShipPosition = { ...ship.position };
+    updateShooting(dt);
+    stepShip(dt);
+  } else {
+    updateRespawn(dt);
+  }
+  updateProjectiles(dt);
+  updateParticles(dt);
   shipWorld = planeToWorld(config.start, basis, ship.position);
   maybeLoadStars(false);
   const stars = starSource.project({
@@ -292,11 +377,11 @@ pixi.ticker.add((ticker) => {
 function applyConfig(): void {
   config = readConfigFromForm();
   basis = planeBasisFromNormal(config.normal);
-  ship.position = { x: 0, y: 0 };
-  ship.velocity = { x: 0, y: 0 };
-  ship.angularVelocity = 0;
-  ship.heading = Math.PI / 2;
+  resetShipState();
   cancelStopAutopilot();
+  explosion.shipAlive = true;
+  explosion.respawnInSeconds = 0;
+  clearEffects();
   shipWorld = planeToWorld(config.start, basis, ship.position);
   lastQueryCenter = null;
   nextQueryAt = 0;
@@ -355,6 +440,7 @@ function drawScene(stars: StarPoint[]): void {
   }
 
   updateAutoLabels(visibleStars, labelInterestStars, width, height);
+  drawEffects(centerX, centerY, width, height, scale);
   drawShip(centerX, centerY);
 }
 
@@ -523,43 +609,73 @@ function isStarWithinScreenMargin(
     y <= height + marginPx;
 }
 
-function drawShip(centerX: number, centerY: number): void {
-  const direction = {
-    x: Math.cos(ship.heading),
-    y: Math.sin(ship.heading),
-  };
-  const side = { x: -direction.y, y: direction.x };
-  const tip = { x: direction.x * 18, y: direction.y * 18 };
-  const left = {
-    x: direction.x * -13 + side.x * 10,
-    y: direction.y * -13 + side.y * 10,
-  };
-  const right = {
-    x: direction.x * -13 - side.x * 10,
-    y: direction.y * -13 - side.y * 10,
-  };
+function drawEffects(
+  centerX: number,
+  centerY: number,
+  width: number,
+  height: number,
+  scale: number,
+): void {
+  effectsLayer.clear();
 
-  shipLayer.clear();
-  shipLayer
-    .moveTo(centerX + tip.x, centerY - tip.y)
-    .lineTo(centerX + left.x, centerY - left.y)
-    .lineTo(centerX + right.x, centerY - right.y)
-    .closePath()
-    .fill({ alpha: 0.86, color: 0xfff7d1 })
-    .stroke({ alpha: 0.95, color: 0x1ce6b8, width: 2 });
-
-  if ((!stopAutopilotActive && controlActive('thrust')) || stopAutopilotThrusting) {
-    const flame = {
-      x: direction.x * -26,
-      y: direction.y * -26,
-    };
-    shipLayer
-      .moveTo(centerX + left.x * 0.55, centerY - left.y * 0.55)
-      .lineTo(centerX + flame.x, centerY - flame.y)
-      .lineTo(centerX + right.x * 0.55, centerY - right.y * 0.55)
-      .closePath()
-      .fill({ alpha: 0.72, color: 0xff8a3d });
+  for (const particle of particles) {
+    const screen = planePointToScreen(particle.position, centerX, centerY, scale);
+    if (!isStarWithinScreenMargin(screen.x, screen.y, width, height, 80)) {
+      continue;
+    }
+    const lifeRatio = 1 - particle.age / particle.life;
+    const flicker = particle.kind === 'spark' && Math.random() < 0.28 ? 0.55 : 1;
+    const alpha = clamp(lifeRatio * flicker, 0, particle.kind === 'spark' ? 0.88 : 0.96);
+    const size = particle.sizePx * clamp(0.55 + lifeRatio * 0.65, 0.55, 1.2);
+    effectsLayer
+      .rect(screen.x - size / 2, screen.y - size / 2, size, size)
+      .fill({ alpha, color: particle.color });
   }
+
+  for (const projectile of projectiles) {
+    const screen = planePointToScreen(projectile.position, centerX, centerY, scale);
+    if (!isStarWithinScreenMargin(screen.x, screen.y, width, height, 80)) {
+      continue;
+    }
+    const alpha = clamp(1 - projectile.age / projectile.life, 0.28, 1);
+    effectsLayer
+      .rect(
+        screen.x - PROJECTILE_SIZE_PX / 2,
+        screen.y - PROJECTILE_SIZE_PX / 2,
+        PROJECTILE_SIZE_PX,
+        PROJECTILE_SIZE_PX,
+      )
+      .fill({ alpha, color: 0xffffff });
+  }
+
+  for (const shard of shards) {
+    const screen = planePointToScreen(shard.position, centerX, centerY, scale);
+    if (!isStarWithinScreenMargin(screen.x, screen.y, width, height, 100)) {
+      continue;
+    }
+    const dx = Math.cos(shard.angle) * shard.lengthPx / 2;
+    const dy = Math.sin(shard.angle) * shard.lengthPx / 2;
+    const alpha = clamp(1 - shard.age / shard.life, 0, 0.95);
+    effectsLayer
+      .moveTo(screen.x - dx, screen.y - dy)
+      .lineTo(screen.x + dx, screen.y + dy)
+      .stroke({ alpha, color: shard.color, width: 1 });
+  }
+}
+
+function drawShip(centerX: number, centerY: number): void {
+  shipLayer.clear();
+  if (!explosion.shipAlive) {
+    return;
+  }
+
+  const points = SHIP_POINTS_PX.map((point) => localPointToScreen(point, centerX, centerY));
+  shipLayer
+    .moveTo(points[0].x, points[0].y)
+    .lineTo(points[1].x, points[1].y)
+    .lineTo(points[2].x, points[2].y)
+    .closePath()
+    .stroke({ alpha: 0.96, color: 0xffffff, width: 1.5 });
 }
 
 function findHoveredStar(stars: StarPoint[]): StarPoint | null {
@@ -607,6 +723,10 @@ function isManualFlightKey(code: string): boolean {
     'KeyD',
     'KeyW',
   ].includes(code);
+}
+
+function isFireKey(code: string): boolean {
+  return code === 'Space';
 }
 
 function maybeLoadStars(force: boolean): void {
@@ -675,8 +795,309 @@ function requireElement<T extends Element>(selector: string): T {
   return element;
 }
 
+function updateShooting(dt: number): void {
+  shotCooldown = Math.max(0, shotCooldown - dt);
+  if (!fireControlActive() || shotCooldown > 0) {
+    return;
+  }
+  requestFire();
+}
+
+function requestFire(): void {
+  if (!explosion.shipAlive || shotCooldown > 0) {
+    return;
+  }
+  fireProjectile();
+  shotCooldown = FIRE_COOLDOWN_SECONDS;
+}
+
+function updateProjectiles(dt: number): void {
+  const collisionRadiusPc = SHIP_COLLISION_RADIUS_PX / pixelsPerParsec();
+  for (let index = projectiles.length - 1; index >= 0; index--) {
+    const projectile = projectiles[index];
+    const previousProjectilePosition = { ...projectile.position };
+    const previousAge = projectile.age;
+    projectile.age += dt;
+    projectile.position.x += projectile.velocity.x * dt;
+    projectile.position.y += projectile.velocity.y * dt;
+    if (
+      explosion.shipAlive &&
+      hasProjectileHitShip(projectile, previousProjectilePosition, previousAge, dt, collisionRadiusPc)
+    ) {
+      projectiles.splice(index, 1);
+      explodeShip();
+      continue;
+    }
+
+    if (projectile.age >= projectile.life) {
+      projectiles.splice(index, 1);
+    }
+  }
+}
+
+function updateParticles(dt: number): void {
+  const drag = Math.pow(PARTICLE_DRAG, dt);
+  for (let index = particles.length - 1; index >= 0; index--) {
+    const particle = particles[index];
+    particle.age += dt;
+    particle.position.x += particle.velocity.x * dt;
+    particle.position.y += particle.velocity.y * dt;
+    particle.velocity.x *= drag;
+    particle.velocity.y *= drag;
+    if (particle.age >= particle.life) {
+      particles.splice(index, 1);
+    }
+  }
+
+  for (let index = shards.length - 1; index >= 0; index--) {
+    const shard = shards[index];
+    shard.age += dt;
+    shard.position.x += shard.velocity.x * dt;
+    shard.position.y += shard.velocity.y * dt;
+    shard.velocity.x *= drag;
+    shard.velocity.y *= drag;
+    shard.angle += shard.angularVelocity * dt;
+    if (shard.age >= shard.life) {
+      shards.splice(index, 1);
+    }
+  }
+}
+
+function updateRespawn(dt: number): void {
+  explosion.respawnInSeconds -= dt;
+  if (explosion.respawnInSeconds > 0) {
+    return;
+  }
+  resetShipState();
+  explosion.shipAlive = true;
+  explosion.respawnInSeconds = 0;
+  lastQueryCenter = null;
+  nextQueryAt = 0;
+}
+
+function fireControlActive(): boolean {
+  return keys.has('Space') || buttonControls.has('fire');
+}
+
+function fireProjectile(): void {
+  const direction = directionFromHeading(ship.heading);
+  const muzzle = localPointToPlane(SHIP_GUN_POINT_PX, pixelsPerParsec());
+  const launchVelocity = { ...ship.velocity };
+  projectiles.push({
+    age: 0,
+    life: PROJECTILE_LIFE_SECONDS,
+    ownerFuse: PROJECTILE_OWNER_FUSE_SECONDS,
+    position: muzzle,
+    velocity: {
+      x: launchVelocity.x + direction.x * PROJECTILE_SPEED_PC,
+      y: launchVelocity.y + direction.y * PROJECTILE_SPEED_PC,
+    },
+  });
+}
+
+function hasProjectileHitShip(
+  projectile: Projectile,
+  previousProjectilePosition: Vec2,
+  previousAge: number,
+  dt: number,
+  collisionRadiusPc: number,
+): boolean {
+  const activeStartAge = Math.max(projectile.ownerFuse, previousAge);
+  const activeEndAge = Math.min(projectile.age, projectile.life);
+  if (activeStartAge > activeEndAge || dt <= 0) {
+    return false;
+  }
+
+  const startProgress = clamp((activeStartAge - previousAge) / dt, 0, 1);
+  const endProgress = clamp((activeEndAge - previousAge) / dt, 0, 1);
+  const relativeStart = interpolateRelativeProjectilePosition(
+    previousProjectilePosition,
+    projectile.position,
+    previousShipPosition,
+    ship.position,
+    startProgress,
+  );
+  const relativeEnd = interpolateRelativeProjectilePosition(
+    previousProjectilePosition,
+    projectile.position,
+    previousShipPosition,
+    ship.position,
+    endProgress,
+  );
+  return distanceSquaredToOriginSegment(relativeStart, relativeEnd) <= collisionRadiusPc * collisionRadiusPc;
+}
+
+function spawnThrustSparks(thrust: number, dt: number): void {
+  sparkAccumulator += SPARKS_PER_SECOND * thrust * dt;
+  const engine = localPointToPlane(SHIP_ENGINE_POINT_PX, pixelsPerParsec());
+  while (sparkAccumulator >= 1) {
+    sparkAccumulator -= 1;
+    const angle = ship.heading + Math.PI + randomRange(-SPARK_SPREAD_RADIANS, SPARK_SPREAD_RADIANS);
+    const speed = randomRange(4.5, 13);
+    const color = SPARK_COLORS[Math.floor(Math.random() * SPARK_COLORS.length)] ?? SPARK_COLORS[0];
+    particles.push({
+      age: 0,
+      color,
+      kind: 'spark',
+      life: randomRange(0.18, 0.52),
+      position: {
+        x: engine.x + randomRange(-0.08, 0.08),
+        y: engine.y + randomRange(-0.08, 0.08),
+      },
+      sizePx: SPARK_SIZE_PX,
+      velocity: {
+        x: ship.velocity.x + Math.cos(angle) * speed,
+        y: ship.velocity.y + Math.sin(angle) * speed,
+      },
+    });
+  }
+}
+
+function explodeShip(): void {
+  const origin = { ...ship.position };
+  const inheritedVelocity = { ...ship.velocity };
+  explosion.shipAlive = false;
+  explosion.respawnInSeconds = EXPLOSION_RESPAWN_SECONDS;
+  cancelStopAutopilot();
+  clearManualFlightInputs();
+
+  for (let index = 0; index < 58; index++) {
+    const angle = randomRange(0, Math.PI * 2);
+    const speed = randomRange(7, 36);
+    const color = DEBRIS_COLORS[Math.floor(Math.random() * DEBRIS_COLORS.length)] ?? DEBRIS_COLORS[0];
+    particles.push({
+      age: 0,
+      color,
+      kind: 'debris',
+      life: randomRange(0.55, 1.45),
+      position: {
+        x: origin.x + randomRange(-0.18, 0.18),
+        y: origin.y + randomRange(-0.18, 0.18),
+      },
+      sizePx: randomRange(2, 4),
+      velocity: {
+        x: inheritedVelocity.x + Math.cos(angle) * speed,
+        y: inheritedVelocity.y + Math.sin(angle) * speed,
+      },
+    });
+  }
+
+  for (let index = 0; index < 7; index++) {
+    const angle = randomRange(0, Math.PI * 2);
+    const speed = randomRange(5, 20);
+    shards.push({
+      age: 0,
+      angle,
+      angularVelocity: randomRange(-9, 9),
+      color: index % 3 === 0 ? 0xffffff : 0xff6330,
+      lengthPx: randomRange(7, 15),
+      life: randomRange(0.65, 1.25),
+      position: { ...origin },
+      velocity: {
+        x: inheritedVelocity.x + Math.cos(angle) * speed,
+        y: inheritedVelocity.y + Math.sin(angle) * speed,
+      },
+    });
+  }
+
+  ship.velocity.x = 0;
+  ship.velocity.y = 0;
+  ship.angularVelocity = 0;
+}
+
+function resetShipState(): void {
+  ship.position = { x: 0, y: 0 };
+  ship.velocity = { x: 0, y: 0 };
+  ship.angularVelocity = 0;
+  ship.heading = Math.PI / 2;
+  previousShipPosition = { ...ship.position };
+  shotCooldown = 0;
+  sparkAccumulator = 0;
+}
+
+function clearEffects(): void {
+  projectiles.length = 0;
+  particles.length = 0;
+  shards.length = 0;
+  effectsLayer.clear();
+}
+
+function localPointToPlane(localPoint: Vec2, scale: number): Vec2 {
+  const direction = directionFromHeading(ship.heading);
+  const side = sideFromDirection(direction);
+  return {
+    x: ship.position.x + (direction.x * localPoint.x + side.x * localPoint.y) / scale,
+    y: ship.position.y + (direction.y * localPoint.x + side.y * localPoint.y) / scale,
+  };
+}
+
+function localPointToScreen(localPoint: Vec2, centerX: number, centerY: number): Vec2 {
+  const direction = directionFromHeading(ship.heading);
+  const side = sideFromDirection(direction);
+  const x = direction.x * localPoint.x + side.x * localPoint.y;
+  const y = direction.y * localPoint.x + side.y * localPoint.y;
+  return {
+    x: centerX + x,
+    y: centerY - y,
+  };
+}
+
+function planePointToScreen(point: Vec2, centerX: number, centerY: number, scale: number): Vec2 {
+  return {
+    x: centerX + (point.x - ship.position.x) * scale,
+    y: centerY - (point.y - ship.position.y) * scale,
+  };
+}
+
+function interpolateRelativeProjectilePosition(
+  projectileStart: Vec2,
+  projectileEnd: Vec2,
+  shipStart: Vec2,
+  shipEnd: Vec2,
+  progress: number,
+): Vec2 {
+  return {
+    x: interpolate(projectileStart.x, projectileEnd.x, progress) - interpolate(shipStart.x, shipEnd.x, progress),
+    y: interpolate(projectileStart.y, projectileEnd.y, progress) - interpolate(shipStart.y, shipEnd.y, progress),
+  };
+}
+
+function distanceSquaredToOriginSegment(start: Vec2, end: Vec2): number {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const segmentLengthSquared = dx * dx + dy * dy;
+  if (segmentLengthSquared <= 0) {
+    return start.x * start.x + start.y * start.y;
+  }
+  const progress = clamp(-(start.x * dx + start.y * dy) / segmentLengthSquared, 0, 1);
+  const closestX = start.x + dx * progress;
+  const closestY = start.y + dy * progress;
+  return closestX * closestX + closestY * closestY;
+}
+
+function interpolate(start: number, end: number, progress: number): number {
+  return start + (end - start) * progress;
+}
+
+function directionFromHeading(heading: number): Vec2 {
+  return {
+    x: Math.cos(heading),
+    y: Math.sin(heading),
+  };
+}
+
+function sideFromDirection(direction: Vec2): Vec2 {
+  return {
+    x: -direction.y,
+    y: direction.x,
+  };
+}
+
+function randomRange(min: number, max: number): number {
+  return min + Math.random() * (max - min);
+}
+
 function stepShip(dt: number): void {
-  stopAutopilotThrusting = false;
   const thrust = stopAutopilotActive
     ? updateStopAutopilot(dt)
     : updateManualFlight(dt);
@@ -688,6 +1109,7 @@ function stepShip(dt: number): void {
   if (thrust > 0) {
     ship.velocity.x += direction.x * thrust * SHIP_ACCELERATION_PC * dt;
     ship.velocity.y += direction.y * thrust * SHIP_ACCELERATION_PC * dt;
+    spawnThrustSparks(thrust, dt);
   }
 
   const limitedVelocity = limit2(ship.velocity, MAX_SPEED_PC);
@@ -733,7 +1155,6 @@ function updateStopAutopilot(dt: number): number {
     return 0;
   }
 
-  stopAutopilotThrusting = true;
   return 1;
 }
 
@@ -744,13 +1165,11 @@ function engageStopAutopilot(): void {
     return;
   }
   stopAutopilotActive = true;
-  stopAutopilotThrusting = false;
   ship.angularVelocity = 0;
 }
 
 function cancelStopAutopilot(): void {
   stopAutopilotActive = false;
-  stopAutopilotThrusting = false;
 }
 
 function finishStopAutopilot(): void {
@@ -762,7 +1181,7 @@ function finishStopAutopilot(): void {
 
 function clearManualFlightInputs(): void {
   for (const key of [...keys]) {
-    if (isManualFlightKey(key)) {
+    if (isManualFlightKey(key) || isFireKey(key)) {
       keys.delete(key);
     }
   }
