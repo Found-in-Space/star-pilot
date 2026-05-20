@@ -1,0 +1,22 @@
+{
+  "name": "star-pilot",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "typescript": "~6.0.2",
+    "vite": "^8.0.12"
+  },
+  "dependencies": {
+    "@found-in-space/meta-sidecar-provider": "file:../skykit/packages/meta-sidecar-provider",
+    "@found-in-space/star-octree-provider": "file:../skykit/packages/star-octree-provider",
+    "@found-in-space/star-trees": "file:../skykit/packages/star-trees",
+    "pixi.js": "^8.18.1"
+  }
+}
