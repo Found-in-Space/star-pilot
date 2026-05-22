@@ -1,4 +1,4 @@
-# Build Star Pilot with a pinned SkyKit checkout and deploy to GitHub Pages.
+# Build Star Pilot and deploy to GitHub Pages.
 #
 # Repo settings -> Pages -> Build and deployment -> Source: GitHub Actions.
 name: Deploy Star Pilot to GitHub Pages
@@ -17,46 +17,26 @@ concurrency:
   group: pages
   cancel-in-progress: false
 
-env:
-  SKYKIT_REPOSITORY: Found-in-Space/skykit
-  SKYKIT_SHA: 480b13fdee58ada85abf71ea4ee735d8d0d14fb0
-
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Check out Star Pilot
         uses: actions/checkout@v6
-        with:
-          path: star-pilot
-
-      - name: Check out pinned SkyKit
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ env.SKYKIT_REPOSITORY }}
-          ref: ${{ env.SKYKIT_SHA }}
-          path: skykit
 
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: |
-            skykit/package-lock.json
-            star-pilot/package-lock.json
+          cache-dependency-path: package-lock.json
 
       - run: npm ci
-        working-directory: skykit
-
-      - run: npm ci
-        working-directory: star-pilot
 
       - run: npm run build
-        working-directory: star-pilot
 
       - uses: actions/upload-pages-artifact@v5
         with:
-          path: star-pilot/dist
+          path: dist
 
   deploy:
     environment:

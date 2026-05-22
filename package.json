@@ -14,9 +14,9 @@
     "vite": "^8.0.12"
   },
   "dependencies": {
-    "@found-in-space/meta-sidecar-provider": "file:../skykit/packages/meta-sidecar-provider",
-    "@found-in-space/star-octree-provider": "file:../skykit/packages/star-octree-provider",
-    "@found-in-space/star-trees": "file:../skykit/packages/star-trees",
+    "@found-in-space/meta-sidecar-provider": "0.2.0-alpha.0",
+    "@found-in-space/star-octree-provider": "0.2.0-alpha.0",
+    "@found-in-space/star-trees": "0.2.0-alpha.0",
     "pixi.js": "^8.18.1"
   }
 }

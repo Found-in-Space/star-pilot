@@ -9,8 +9,8 @@ The first pass takes:
 - game normal vector for the 2D play plane
 - universe slice thickness in parsecs
 
-It streams Gaia-derived stars from the local SkyKit alpha
-`@found-in-space/star-octree-provider` with an app-owned **Pizza Strategy**:
+It streams Gaia-derived stars from the published SkyKit alpha
+`@found-in-space/star-octree-provider` package with an app-owned **Pizza Strategy**:
 cells are requested only when their semantic octree bounds intersect the round
 slice around the ship. The loaded pizza diameter is twice the visible play
 circle diameter, giving the ship room to scroll before the next slice finishes
@@ -37,5 +37,4 @@ npm install
 npm run dev -- --host 127.0.0.1 --port 4323
 ```
 
-The project uses `file:` dependencies for the sibling SkyKit alpha packages so
-changes in `../skykit/packages/*` can be tested locally.
+The project consumes the published SkyKit alpha packages from npm.
