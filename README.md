@@ -3,6 +3,10 @@
 PixiJS + TypeScript + Vite sketch for a SkyKit-powered learning-through-play
 demo.
 
+Star Pilot is inspired by [XPilot](https://www.xpilot.org/), the classic 2D space
+game. It is an independent project focused on exploring real stellar data
+through play.
+
 The first pass takes:
 
 - starting position `(x, y, z)` in parsecs
